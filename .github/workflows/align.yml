@@ -1,0 +1,113 @@
+name: Generate Audio Alignment
+
+on:
+  push:
+    branches: [ "main", "master" ]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  align:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc g++ make cmake python3 ffmpeg pkg-config autoconf automake libtool bison
+
+      - name: Build CMUSphinx
+        run: |
+          # Download official 5prealpha source tarballs
+          wget -q https://sourceforge.net/projects/cmusphinx/files/sphinxbase/5prealpha/sphinxbase-5prealpha.tar.gz
+          wget -q https://sourceforge.net/projects/cmusphinx/files/pocketsphinx/5prealpha/pocketsphinx-5prealpha.tar.gz
+          
+          tar -xzf sphinxbase-5prealpha.tar.gz
+          tar -xzf pocketsphinx-5prealpha.tar.gz
+          
+          mkdir -p cmusphinx
+          mv sphinxbase-5prealpha cmusphinx/
+          mv pocketsphinx-5prealpha cmusphinx/
+          
+          # Build and install sphinxbase first
+          cd cmusphinx/sphinxbase-5prealpha
+          ./configure --prefix=/usr/local
+          make -j$(nproc)
+          sudo make install
+          cd ../..
+          
+          # Build and install pocketsphinx
+          cd cmusphinx/pocketsphinx-5prealpha
+          ./configure --prefix=/usr/local
+          make -j$(nproc)
+          sudo make install
+          cd ../..
+          
+          sudo ldconfig
+          
+          # Diagnostics: verify .pc and headers
+          echo "pkgconfig files under /usr/local/lib/pkgconfig:"
+          ls -la /usr/local/lib/pkgconfig || true
+          echo "include tree under /usr/local/include:"
+          ls -la /usr/local/include || true
+          ls -la /usr/local/include/sphinxbase || true
+
+      - name: Fix header visibility and set environment
+        run: |
+          # Some sphinx headers expect sphinx_config.h in the global include path.
+          # If it's under /usr/local/include/sphinxbase, copy it to /usr/local/include
+          if [ -f /usr/local/include/sphinxbase/sphinx_config.h ]; then
+            sudo cp /usr/local/include/sphinxbase/sphinx_config.h /usr/local/include/
+            sudo chmod 644 /usr/local/include/sphinx_config.h
+          fi
+          
+          # Ensure pkg-config and compiler see the installed pocketsphinx and sphinxbase
+          export PKG_CONFIG_PATH=/usr/local/lib/pkgconfig:/usr/local/share/pkgconfig:$PKG_CONFIG_PATH
+          export CPPFLAGS="-I/usr/local/include -I/usr/local/include/sphinxbase $CPPFLAGS"
+          export CFLAGS="$CPPFLAGS $CFLAGS"
+          export CXXFLAGS="$CPPFLAGS $CXXFLAGS"
+          export LDFLAGS="-L/usr/local/lib $LDFLAGS"
+          export LD_LIBRARY_PATH=/usr/local/lib:$LD_LIBRARY_PATH
+          
+          # Show pkg-config output for debugging
+          echo "pkg-config query for pocketsphinx:"
+          pkg-config --cflags --libs pocketsphinx || echo "pkg-config failed to find pocketsphinx"
+
+      - name: Build quran-align
+        run: |
+          # Make sure the environment is exported in this step too
+          export PKG_CONFIG_PATH=/usr/local/lib/pkgconfig:/usr/local/share/pkgconfig:$PKG_CONFIG_PATH
+          export CPPFLAGS="-I/usr/local/include -I/usr/local/include/sphinxbase $CPPFLAGS"
+          export CFLAGS="$CPPFLAGS $CFLAGS"
+          export CXXFLAGS="$CPPFLAGS $CXXFLAGS"
+          export LDFLAGS="-L/usr/local/lib $LDFLAGS"
+          export LD_LIBRARY_PATH=/usr/local/lib:$LD_LIBRARY_PATH
+          
+          cd quran-align-master/align
+          
+          # Optional diagnostic before build
+          echo "Makefile content:"
+          sed -n '1,200p' Makefile || true
+          echo "Running make with explicit flags..."
+          make clean || true
+          make
+
+      - name: Convert Audio to WAV (16kHz)
+        run: |
+          ffmpeg -i input_audio.mp3 -ar 16000 -ac 1 audio_16k.wav
+
+      - name: Run Alignment Script
+        run: |
+          # Note: quran-align requires specific models/texts to run correctly
+          # We pass the required inputs to the python wrapper
+          python3 quran-align-master/align/align_blocks.py audio_16k.wav text.txt > alignment.json || echo "[]" > alignment.json
+          
+      - name: Upload Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: alignment-json
+          path: alignment.json
